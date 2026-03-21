@@ -1,4 +1,5 @@
 import os
+import base64
 import uuid
 import tempfile
 import httpx
@@ -197,16 +198,24 @@ async def build_document_tree(
     if not os.getenv("GROQ_API_KEY"):
         raise HTTPException(status_code=500, detail="GROQ_API_KEY not set")
 
-    async with httpx.AsyncClient(timeout=60, follow_redirects=True) as client:
-        r = await client.get(req.file_url)
-        if r.status_code != 200:
-            raise HTTPException(status_code=400, detail=f"Cannot download: HTTP {r.status_code}")
-        if "text/html" in r.headers.get("content-type", ""):
-            raise HTTPException(
-                status_code=400,
-                detail="URL returned HTML. For Google Drive use: https://drive.google.com/uc?export=download&id=FILE_ID"
-            )
-        pdf_bytes = r.content
+    if req.file_url.startswith("data:"):
+        # Data URI — decode base64 payload directly
+        try:
+            header, encoded = req.file_url.split(",", 1)
+            pdf_bytes = base64.b64decode(encoded)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Invalid data URI: {e}")
+    else:
+        async with httpx.AsyncClient(timeout=60, follow_redirects=True) as client:
+            r = await client.get(req.file_url)
+            if r.status_code != 200:
+                raise HTTPException(status_code=400, detail=f"Cannot download: HTTP {r.status_code}")
+            if "text/html" in r.headers.get("content-type", ""):
+                raise HTTPException(
+                    status_code=400,
+                    detail="URL returned HTML. For Google Drive use: https://drive.google.com/uc?export=download&id=FILE_ID"
+                )
+            pdf_bytes = r.content
 
     with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
         tmp.write(pdf_bytes)
