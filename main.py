@@ -25,14 +25,7 @@ def verify_key(x_api_key: str):
         raise HTTPException(status_code=401, detail="Invalid API key")
 
 
-# ── Groq call — JSON mode, no schema constraints ─────────────────────────────
 def call_groq(prompt: str) -> str:
-    """
-    Groq: completely free forever, no credits, no expiry.
-    Model: llama-3.3-70b-versatile — 128k context, excellent instruction following.
-    JSON mode: forces valid JSON output, no schema constraints that break nesting.
-    Free limits: 6000 tokens/min, 500 requests/day on free tier.
-    """
     api_key = os.getenv("GROQ_API_KEY")
     if not api_key:
         raise HTTPException(status_code=500, detail="GROQ_API_KEY not set")
@@ -69,9 +62,7 @@ def call_groq(prompt: str) -> str:
     return data["choices"][0]["message"]["content"].strip()
 
 
-# ── PDF extraction ────────────────────────────────────────────────────────────
 def extract_pdf_text(pdf_path: str) -> tuple:
-    """Extract full text with [PAGE N] markers."""
     import pypdf
     reader = pypdf.PdfReader(pdf_path)
     total = len(reader.pages)
@@ -84,52 +75,36 @@ def extract_pdf_text(pdf_path: str) -> tuple:
 
 
 def extract_toc_pages(raw_text: str) -> str:
-    """
-    Extract the actual Table of Contents pages.
-    Finds [PAGE N] markers that contain 'CONTENTS' or 'CHAPTER' patterns.
-    Returns text of those pages + next 4 pages.
-    """
     lines = raw_text.split("\n")
     toc_start_idx = None
-
-    # Find the page marker just before the TOC
     current_page_idx = None
     for i, line in enumerate(lines):
         if re.match(r'\[PAGE \d+\]', line):
             current_page_idx = i
-        # Look for TOC indicators in current page content
         if current_page_idx is not None and re.search(r'\bCONTENTS\b|\bCHAPTER[-\s]+1\b', line, re.IGNORECASE):
-            # Check if this looks like a TOC (has page numbers pattern like "1-8" or just "1")
             context = "\n".join(lines[current_page_idx:current_page_idx+30])
             if re.search(r'CHAPTER.*\d+[-\d]*\s*$', context, re.MULTILINE | re.IGNORECASE):
                 toc_start_idx = current_page_idx
                 break
 
     if toc_start_idx is None:
-        # Fallback: find first occurrence of CHAPTER-1 or similar
-        match = re.search(r'\[PAGE \d+\]', raw_text)
-        if match:
-            # Try to find pages 12-17 directly as most theses have TOC there
-            toc_match = re.search(r'(\[PAGE 1[0-9]\].*?CHAPTER)', raw_text, re.DOTALL)
-            if toc_match:
-                toc_start_idx = raw_text.rfind('\n[PAGE', 0, toc_match.start()) + 1
+        toc_match = re.search(r'(\[PAGE 1[0-9]\].*?CHAPTER)', raw_text, re.DOTALL)
+        if toc_match:
+            toc_start_idx_pos = raw_text.rfind('\n[PAGE', 0, toc_match.start()) + 1
+            lines_before = raw_text[:toc_start_idx_pos].split("\n")
+            toc_start_idx = len(lines_before)
 
     if toc_start_idx is None:
-        return raw_text[10000:18000]  # fallback: middle section
+        return raw_text[10000:18000]
 
     toc_text_start = "\n".join(lines[toc_start_idx:])
-
-    # Find all [PAGE N] positions from here
     page_positions = [m.start() for m in re.finditer(r'\[PAGE \d+\]', toc_text_start)]
-
-    # Return up to 5 pages of TOC content (covers multi-page TOCs)
     if len(page_positions) >= 6:
         return toc_text_start[:page_positions[5]]
     return toc_text_start[:8000]
 
 
 def get_page_content(raw_text: str, page_index: int, pages: int = 3) -> str:
-    """Fetch actual PDF content for a given page range."""
     content = ""
     for p in range(page_index, page_index + pages):
         m1 = f"[PAGE {p}]"
@@ -142,17 +117,6 @@ def get_page_content(raw_text: str, page_index: int, pages: int = 3) -> str:
 
 
 def detect_page_offset(raw_text: str, toc_chapter1_page: int = 1) -> int:
-    """
-    Academic PDFs have roman numeral front matter (abstract, TOC, etc.)
-    that shifts all chapter page numbers. The TOC says "Chapter 1 = page 1"
-    but in the PDF it might be [PAGE 18].
-
-    Strategy: find the first real chapter heading in raw_text, get its
-    [PAGE N] number, subtract the TOC page number to get the offset.
-
-    e.g. Chapter 1 at [PAGE 18] with TOC saying page 1 → offset = 17
-    """
-    # Look for CHAPTER heading markers
     patterns = [
         r'\[PAGE (\d+)\]\s*\n.*?Chapter\s+1\b',
         r'\[PAGE (\d+)\]\s*\n\s*1\s*\n.*?INTRODUCTION',
@@ -165,41 +129,31 @@ def detect_page_offset(raw_text: str, toc_chapter1_page: int = 1) -> int:
             pdf_page = int(m.group(1))
             offset = pdf_page - toc_chapter1_page
             return max(0, offset)
-
-    # Fallback: count pages with roman numeral content before arabic page 1
-    # Find where "1 " appears as a page marker in text (indicating page 1 of main text)
     roman_pages = re.findall(r'\[PAGE (\d+)\]\n[ivxlcdmIVXLCDM]+\s', raw_text)
     if roman_pages:
         return len(roman_pages)
-
-    return 0  # No offset detected
-
-
-def flatten_tree(nodes: list) -> list:
-    """Flatten nested tree to list."""
-    result = []
-    for n in nodes:
-        result.append(n)
-        if n.get("nodes"):
-            result.extend(flatten_tree(n["nodes"]))
-    return result
+    return 0
 
 
-def enrich_summaries(tree: list, raw_text: str, offset: int = 0) -> list:
+def clean_tree(nodes: list) -> list:
     """
-    Add real page content to each node using corrected PDF page numbers.
-
-    offset: difference between PDF page numbers and TOC page numbers
-    e.g. if TOC says "page 1" but PDF has [PAGE 18], offset = 17
+    PageIndex approach: tree nodes contain ONLY navigation data.
+    Strip any page_content, description, or extra fields the LLM may have added.
+    The tree is a pure navigation index — titles + short summaries (text field).
+    Raw content is fetched separately using page_index at query time.
     """
-    for node in tree:
-        toc_page = node.get("page_index", 1)
-        pdf_page = toc_page + offset
-        content = get_page_content(raw_text, pdf_page, pages=2)
-        node["page_content"] = content[:1500] if content else node.get("text", "")
-        if node.get("nodes"):
-            node["nodes"] = enrich_summaries(node["nodes"], raw_text, offset)
-    return tree
+    allowed = {"node_id", "title", "page_index", "text", "nodes"}
+    cleaned = []
+    for node in nodes:
+        clean_node = {k: v for k, v in node.items() if k in allowed}
+        # Ensure text is short — truncate to 200 chars if LLM made it too long
+        if "text" in clean_node and len(clean_node["text"]) > 300:
+            clean_node["text"] = clean_node["text"][:300].rsplit(" ", 1)[0] + "..."
+        # Recurse into children
+        if "nodes" in clean_node and isinstance(clean_node["nodes"], list):
+            clean_node["nodes"] = clean_tree(clean_node["nodes"])
+        cleaned.append(clean_node)
+    return cleaned
 
 
 def count_nodes(nodes: list) -> int:
@@ -211,8 +165,6 @@ def count_nodes(nodes: list) -> int:
     return c
 
 
-# ── Routes ────────────────────────────────────────────────────────────────────
-
 class UploadRequest(BaseModel):
     file_url: str
     file_name: Optional[str] = "document.pdf"
@@ -223,7 +175,7 @@ def health():
     return {
         "status": "ok",
         "model": "llama-3.3-70b-versatile via Groq",
-        "cost": "completely free forever",
+        "approach": "PageIndex — tree is navigation only, raw_text is content store",
         "mode": "stateless — stores nothing"
     }
 
@@ -234,18 +186,17 @@ async def build_document_tree(
     x_api_key: str = Header(...)
 ):
     """
-    PageIndex tree building with Groq (free):
-    1. Extract full PDF text with page markers
-    2. Find and extract TOC pages
-    3. Single-pass tree building from TOC + context
-    4. Enrich each node with actual page content
+    PageIndex tree building:
+    1. Extract full PDF text with [PAGE N] markers → stored as raw_text
+    2. Build navigation tree from TOC (titles + short descriptions only)
+    3. NO page_content embedded in tree — raw_text is the content store
+    4. At query time, tree search picks node_ids → page_index → raw_text fetch
     """
     verify_key(x_api_key)
 
     if not os.getenv("GROQ_API_KEY"):
         raise HTTPException(status_code=500, detail="GROQ_API_KEY not set")
 
-    # Download PDF
     async with httpx.AsyncClient(timeout=60, follow_redirects=True) as client:
         r = await client.get(req.file_url)
         if r.status_code != 200:
@@ -267,53 +218,52 @@ async def build_document_tree(
             raise HTTPException(status_code=400, detail="No text extracted from PDF")
 
         toc_text = extract_toc_pages(raw_text)
-        # Also include first chapter start for context
         first_chapter_text = get_page_content(raw_text, 18, pages=3)
 
-        # Single pass — build complete tree from TOC
-        # Return JSON object with "tree" key containing the array
+        # Detect front-matter offset
+        offset = detect_page_offset(raw_text, toc_chapter1_page=1)
+
         prompt = f"""You are implementing the PageIndex document indexing framework.
 
 Document: {req.file_name}
 Total pages: {total_pages}
+Detected front-matter offset: {offset} pages (roman numeral pages before Chapter 1)
 
-=== TABLE OF CONTENTS (pages extracted from document) ===
+=== TABLE OF CONTENTS (extracted from document) ===
 {toc_text}
 
 === START OF CHAPTER 1 (for page number calibration) ===
 {first_chapter_text[:2000]}
 
-Build a COMPLETE hierarchical tree index following the EXACT structure from the Table of Contents above.
+Build a COMPLETE hierarchical navigation tree following the EXACT structure from the Table of Contents.
 
 CRITICAL RULES:
-1. Every chapter in the TOC must appear as a top-level node with all its sections as child nodes
-2. Every numbered section (1.1, 1.2, 2.3.1 etc) must appear as a child or grandchild node
-3. page_index: use EXACTLY the page numbers shown in the TOC — do NOT add any offset, use the numbers as printed
-4. text: 1-2 sentence description of what that section covers based on the title
-5. nodes: must contain ALL child sections listed in the TOC — NEVER use empty array if TOC shows subsections
-6. node_id: "0001" for top level, "0001_01" for children, "0001_01_01" for grandchildren
+1. Every chapter must appear as a top-level node with ALL its sections as children
+2. Every numbered section (1.1, 1.2, 2.3.1 etc) must appear as child/grandchild node
+3. page_index: use EXACTLY the page numbers printed in TOC — do NOT add any offset
+4. text: 1-2 sentence description of what that section covers — this is used for navigation.
+   Keep it SHORT (under 200 chars). Do NOT include actual page content, quotes, or data.
+   Example good text: "Covers thermal and catalytic decomposition reactions of H2O2."
+   Example bad text: "H2O2 → H2O + 1/2O2. The enthalpy is -136.11 kJ/mol..."
+5. nodes: must contain ALL child sections from TOC — never use empty array if subsections exist
+6. node_id: "0001" top level, "0001_01" children, "0001_01_01" grandchildren
+7. ONLY include these 5 fields per node: title, node_id, page_index, text, nodes
+   DO NOT add: page_content, content, description, summary, raw_text, or any other field
 
-Return a JSON object with a single "tree" key containing the array:
+Return a JSON object with a single "tree" key:
 {{
   "tree": [
     {{
       "title": "Chapter 1 - Introduction",
       "node_id": "0001",
-      "page_index": 18,
-      "text": "Introduces spacecraft propulsion, catalysts, and green propellants.",
+      "page_index": 1,
+      "text": "Introduces spacecraft propulsion, green propellants, and catalysts overview.",
       "nodes": [
         {{
           "title": "1.1 Background",
           "node_id": "0001_01",
-          "page_index": 18,
-          "text": "Overview of spacecraft engine types and propulsion catalyst role.",
-          "nodes": []
-        }},
-        {{
-          "title": "1.2 Decomposition of Hydrogen Peroxide",
-          "node_id": "0001_02",
-          "page_index": 20,
-          "text": "Thermal and catalytic decomposition reactions of H2O2.",
+          "page_index": 1,
+          "text": "Overview of spacecraft engine types and the role of propulsion catalysts.",
           "nodes": []
         }}
       ]
@@ -324,13 +274,11 @@ Return a JSON object with a single "tree" key containing the array:
         raw = call_groq(prompt)
         parsed = json.loads(raw)
 
-        # Handle both {"tree": [...]} and direct array
         if isinstance(parsed, dict) and "tree" in parsed:
             tree = parsed["tree"]
         elif isinstance(parsed, list):
             tree = parsed
         else:
-            # Try to find an array value in the dict
             for v in parsed.values():
                 if isinstance(v, list):
                     tree = v
@@ -338,20 +286,17 @@ Return a JSON object with a single "tree" key containing the array:
             else:
                 raise ValueError(f"Unexpected response shape: {list(parsed.keys())}")
 
-        # Detect front-matter offset (roman numeral pages before Chapter 1)
-        # e.g. thesis with 17 roman-numeral pages → offset=17, so TOC "page 1" = PDF [PAGE 18]
-        offset = detect_page_offset(raw_text, toc_chapter1_page=1)
-
-        # Enrich with actual page content using corrected PDF page numbers
-        tree = enrich_summaries(tree, raw_text, offset)
+        # Clean tree — strip any page_content or extra fields LLM may have added
+        # This enforces the PageIndex principle: tree = navigation only
+        tree = clean_tree(tree)
 
         doc_id = f"pi-{uuid.uuid4().hex[:16]}"
 
         return {
             "doc_id": doc_id,
             "file_name": req.file_name,
-            "tree": tree,
-            "raw_text": raw_text,
+            "tree": tree,           # navigation index only — no page content
+            "raw_text": raw_text,   # content store — fetched by page_index at query time
             "tree_node_count": count_nodes(tree),
             "top_level_nodes": len(tree),
             "total_pages": total_pages,
