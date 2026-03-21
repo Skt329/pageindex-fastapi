@@ -1,16 +1,28 @@
+"""
+PageIndex FastAPI — Full Implementation
+Mirrors the VectifyAI/PageIndex architecture with Groq multi-key pool.
+"""
+
 import os
+import asyncio
 import base64
-import uuid
-import tempfile
-import httpx
 import json
 import re
+import tempfile
+import uuid
+import itertools
+from typing import Optional
+
+import httpx
 from fastapi import FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import Optional
 
-app = FastAPI(title="PageIndex Tree Builder — Groq + llama-3.3-70b")
+# ─────────────────────────────────────────────────────────────────────────────
+# App setup
+# ─────────────────────────────────────────────────────────────────────────────
+
+app = FastAPI(title="PageIndex — Groq Multi-Key")
 
 app.add_middleware(
     CORSMiddleware,
@@ -26,136 +38,698 @@ def verify_key(x_api_key: str):
         raise HTTPException(status_code=401, detail="Invalid API key")
 
 
-def call_groq(prompt: str) -> str:
-    api_key = os.getenv("GROQ_API_KEY")
-    if not api_key:
-        raise HTTPException(status_code=500, detail="GROQ_API_KEY not set")
+# ─────────────────────────────────────────────────────────────────────────────
+# Groq Multi-Key Pool
+# ─────────────────────────────────────────────────────────────────────────────
 
-    resp = httpx.post(
-        "https://api.groq.com/openai/v1/chat/completions",
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json"
-        },
-        json={
+def _load_groq_keys() -> list[str]:
+    """Auto-detect all available GROQ_API_KEY_N vars (N=1..20) plus legacy GROQ_API_KEY."""
+    keys = []
+    for i in range(1, 21):
+        k = os.getenv(f"GROQ_API_KEY_{i}")
+        if k and k.strip():
+            keys.append(k.strip())
+    # also support legacy single key
+    legacy = os.getenv("GROQ_API_KEY", "")
+    if legacy.strip() and legacy.strip() not in keys:
+        keys.append(legacy.strip())
+    return keys
+
+
+GROQ_KEYS: list[str] = []  # populated at startup
+_key_cycle: "itertools.cycle | None" = None
+_key_lock = asyncio.Lock()
+
+
+@app.on_event("startup")
+async def startup():
+    global GROQ_KEYS, _key_cycle
+    GROQ_KEYS = _load_groq_keys()
+    if not GROQ_KEYS:
+        raise RuntimeError("No Groq API keys found. Set GROQ_API_KEY_1 ... GROQ_API_KEY_N")
+    _key_cycle = itertools.cycle(range(len(GROQ_KEYS)))
+    print(f"[PageIndex] Loaded {len(GROQ_KEYS)} Groq API key(s)")
+
+
+async def _next_key() -> tuple[int, str]:
+    """Round-robin pick next (index, key) from pool."""
+    async with _key_lock:
+        idx = next(_key_cycle)
+    return idx, GROQ_KEYS[idx]
+
+
+async def llm_call(
+    prompt: str,
+    max_tokens: int = 1024,
+    json_mode: bool = True,
+    system: str = "You are an expert document analyst. Return valid JSON only, no markdown, no extra text.",
+    retries: int = 0,
+) -> str:
+    """
+    Single async LLM call with automatic key rotation on rate-limit (429).
+    max_tokens capped at 4096 to stay within Groq free-tier limits.
+    """
+    max_tokens = min(max_tokens, 4096)
+    tried_keys: set[int] = set()
+
+    for attempt in range(len(GROQ_KEYS) + 1):
+        idx, key = await _next_key()
+        if idx in tried_keys and len(tried_keys) >= len(GROQ_KEYS):
+            raise HTTPException(status_code=429, detail="All Groq keys rate-limited")
+        tried_keys.add(idx)
+
+        payload = {
             "model": "llama-3.3-70b-versatile",
             "messages": [
-                {
-                    "role": "system",
-                    "content": "You are a document analysis expert. You always return valid JSON exactly as requested, with no extra text, no markdown fences, no explanation."
-                },
-                {
-                    "role": "user",
-                    "content": prompt
-                }
+                {"role": "system", "content": system},
+                {"role": "user", "content": prompt},
             ],
             "temperature": 0.1,
-            "max_tokens": 8000,
-            "response_format": {"type": "json_object"}
-        },
-        timeout=120
-    )
+            "max_tokens": max_tokens,
+        }
+        if json_mode:
+            payload["response_format"] = {"type": "json_object"}
 
-    data = resp.json()
-    if "error" in data:
-        raise HTTPException(status_code=500, detail=f"Groq error: {data['error']['message']}")
+        async with httpx.AsyncClient(timeout=120) as client:
+            resp = await client.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+                json=payload,
+            )
 
-    return data["choices"][0]["message"]["content"].strip()
+        if resp.status_code == 429:
+            await asyncio.sleep(1)
+            continue
+
+        data = resp.json()
+        if "error" in data:
+            err = data["error"].get("message", str(data["error"]))
+            if "rate_limit" in err.lower() or "token" in err.lower():
+                await asyncio.sleep(1)
+                continue
+            raise HTTPException(status_code=500, detail=f"Groq error: {err}")
+
+        return data["choices"][0]["message"]["content"].strip()
+
+    raise HTTPException(status_code=429, detail="All Groq keys exhausted")
 
 
-def extract_pdf_text(pdf_path: str) -> tuple:
+async def llm_call_many(prompts: list[str], max_tokens: int = 512, json_mode: bool = True) -> list[str]:
+    """Fan-out: run all prompts concurrently, each on its own key rotation."""
+    tasks = [llm_call(p, max_tokens=max_tokens, json_mode=json_mode) for p in prompts]
+    return await asyncio.gather(*tasks)
+
+
+def extract_json(text: str) -> dict | list:
+    """Robust JSON extractor — strips markdown fences if present."""
+    text = text.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\n?", "", text)
+        text = re.sub(r"\n?```$", "", text)
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        # Try to find a JSON object or array in the text
+        for pattern in [r"\{.*\}", r"\[.*\]"]:
+            m = re.search(pattern, text, re.DOTALL)
+            if m:
+                try:
+                    return json.loads(m.group())
+                except Exception:
+                    pass
+        return {}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PDF Extraction
+# ─────────────────────────────────────────────────────────────────────────────
+
+def extract_pdf_pages(pdf_path: str) -> tuple[list[tuple[str, int]], int]:
+    """
+    Returns (page_list, total_pages) where page_list[i] = (text, physical_page_number).
+    Physical page number is 1-indexed.
+    """
     import pypdf
     reader = pypdf.PdfReader(pdf_path)
     total = len(reader.pages)
     pages = []
     for i, page in enumerate(reader.pages):
         t = page.extract_text() or ""
-        if t.strip():
-            pages.append(f"[PAGE {i+1}]\n{t.strip()}")
-    return "\n\n".join(pages), total
+        pages.append((t.strip(), i + 1))
+    return pages, total
 
 
-def extract_toc_pages(raw_text: str) -> str:
-    lines = raw_text.split("\n")
-    toc_start_idx = None
-    current_page_idx = None
-    for i, line in enumerate(lines):
-        if re.match(r'\[PAGE \d+\]', line):
-            current_page_idx = i
-        if current_page_idx is not None and re.search(r'\bCONTENTS\b|\bCHAPTER[-\s]+1\b', line, re.IGNORECASE):
-            context = "\n".join(lines[current_page_idx:current_page_idx+30])
-            if re.search(r'CHAPTER.*\d+[-\d]*\s*$', context, re.MULTILINE | re.IGNORECASE):
-                toc_start_idx = current_page_idx
-                break
-
-    if toc_start_idx is None:
-        toc_match = re.search(r'(\[PAGE 1[0-9]\].*?CHAPTER)', raw_text, re.DOTALL)
-        if toc_match:
-            toc_start_idx_pos = raw_text.rfind('\n[PAGE', 0, toc_match.start()) + 1
-            lines_before = raw_text[:toc_start_idx_pos].split("\n")
-            toc_start_idx = len(lines_before)
-
-    if toc_start_idx is None:
-        return raw_text[10000:18000]
-
-    toc_text_start = "\n".join(lines[toc_start_idx:])
-    page_positions = [m.start() for m in re.finditer(r'\[PAGE \d+\]', toc_text_start)]
-    if len(page_positions) >= 6:
-        return toc_text_start[:page_positions[5]]
-    return toc_text_start[:8000]
+def get_raw_text(page_list: list[tuple[str, int]]) -> str:
+    """Full raw text with [PAGE N] markers — used as content store."""
+    parts = []
+    for text, phys in page_list:
+        if text:
+            parts.append(f"[PAGE {phys}]\n{text}")
+    return "\n\n".join(parts)
 
 
-def get_page_content(raw_text: str, page_index: int, pages: int = 3) -> str:
-    content = ""
-    for p in range(page_index, page_index + pages):
-        m1 = f"[PAGE {p}]"
-        m2 = f"[PAGE {p+1}]"
-        if m1 in raw_text:
-            s = raw_text.index(m1) + len(m1)
-            e = raw_text.index(m2) if m2 in raw_text else s + 2500
-            content += raw_text[s:e].strip() + "\n\n"
-    return content.strip()
+def get_page_content_by_range(page_list: list, start: int, end: int) -> str:
+    """Fetch text for physical pages start..end (inclusive), with <physical_index_N> tags."""
+    parts = []
+    for text, phys in page_list:
+        if start <= phys <= end:
+            parts.append(f"<physical_index_{phys}>\n{text}\n<physical_index_{phys}>\n")
+    return "\n".join(parts)
 
 
-def detect_page_offset(raw_text: str, toc_chapter1_page: int = 1) -> int:
-    patterns = [
-        r'\[PAGE (\d+)\]\s*\n.*?Chapter\s+1\b',
-        r'\[PAGE (\d+)\]\s*\n\s*1\s*\n.*?INTRODUCTION',
-        r'\[PAGE (\d+)\]\s*\n.*?INTRODUCTION',
-        r'\[PAGE (\d+)\]\s*\n\s*Chapter\s+1',
-    ]
-    for pattern in patterns:
-        m = re.search(pattern, raw_text, re.IGNORECASE | re.DOTALL)
-        if m:
-            pdf_page = int(m.group(1))
-            offset = pdf_page - toc_chapter1_page
-            return max(0, offset)
-    roman_pages = re.findall(r'\[PAGE (\d+)\]\n[ivxlcdmIVXLCDM]+\s', raw_text)
-    if roman_pages:
-        return len(roman_pages)
-    return 0
+# ─────────────────────────────────────────────────────────────────────────────
+# Stage 1: TOC Detection
+# ─────────────────────────────────────────────────────────────────────────────
 
-
-def clean_tree(nodes: list) -> list:
+async def detect_toc_pages(page_list: list[tuple[str, int]], check_up_to: int = 20) -> list[int]:
     """
-    PageIndex approach: tree nodes contain ONLY navigation data.
-    Strip any page_content, description, or extra fields the LLM may have added.
-    The tree is a pure navigation index — titles + short summaries (text field).
-    Raw content is fetched separately using page_index at query time.
+    Concurrently scan first `check_up_to` pages to find TOC pages.
+    Returns list of physical page numbers containing TOC.
     """
-    allowed = {"node_id", "title", "page_index", "text", "nodes"}
-    cleaned = []
-    for node in nodes:
-        clean_node = {k: v for k, v in node.items() if k in allowed}
-        # Ensure text is short — truncate to 200 chars if LLM made it too long
-        if "text" in clean_node and len(clean_node["text"]) > 300:
-            clean_node["text"] = clean_node["text"][:300].rsplit(" ", 1)[0] + "..."
-        # Recurse into children
-        if "nodes" in clean_node and isinstance(clean_node["nodes"], list):
-            clean_node["nodes"] = clean_tree(clean_node["nodes"])
-        cleaned.append(clean_node)
-    return cleaned
+    candidates = page_list[:check_up_to]
 
+    prompts = []
+    for text, phys in candidates:
+        prompts.append(f"""Does the following page contain a Table of Contents (list of chapters/sections with page numbers)?
+Note: abstract, summary, notation lists, figure lists are NOT table of contents.
+
+Page text:
+{text[:2000]}
+
+Return JSON: {{"thinking": "<reason>", "toc_detected": "yes or no"}}""")
+
+    results = await llm_call_many(prompts, max_tokens=150, json_mode=True)
+
+    toc_pages = []
+    for i, (raw, (text, phys)) in enumerate(zip(results, candidates)):
+        parsed = extract_json(raw)
+        if isinstance(parsed, dict) and parsed.get("toc_detected") == "yes":
+            toc_pages.append(phys)
+
+    # Group consecutive pages (TOC usually spans 1-3 pages)
+    return toc_pages
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Stage 2: TOC Extraction (multi-pass with completion verification)
+# ─────────────────────────────────────────────────────────────────────────────
+
+EXTRACT_TOC_PROMPT = """Extract the FULL table of contents from the given text.
+Replace any ......... or dotted leaders with :.
+Return ONLY the table of contents text, nothing else."""
+
+VERIFY_TOC_COMPLETE_PROMPT = """You are given a raw table of contents and a cleaned/extracted version.
+Check if the cleaned version is complete (contains all main sections from the raw).
+
+Raw TOC:
+{raw}
+
+Cleaned TOC:
+{cleaned}
+
+Return JSON: {{"thinking": "<reason>", "completed": "yes or no"}}"""
+
+CONTINUE_TOC_PROMPT = """Continue the table of contents extraction. Output ONLY the remaining part (not what was already extracted).
+
+Original raw TOC:
+{raw}
+
+Already extracted:
+{partial}
+
+Continue from where it left off:"""
+
+
+async def extract_toc_with_retry(toc_raw: str, max_attempts: int = 5) -> str:
+    """Multi-pass TOC extraction with completion-verification retry loop."""
+
+    prompt = f"{EXTRACT_TOC_PROMPT}\n\nGiven text:\n{toc_raw[:4000]}"
+    extracted, _ = await _llm_with_finish_reason(prompt, max_tokens=2000)
+
+    for attempt in range(max_attempts):
+        verify_prompt = VERIFY_TOC_COMPLETE_PROMPT.format(
+            raw=toc_raw[:3000], cleaned=extracted
+        )
+        verify_raw = await llm_call(verify_prompt, max_tokens=200, json_mode=True)
+        verify = extract_json(verify_raw)
+        completed = verify.get("completed", "no") if isinstance(verify, dict) else "no"
+
+        if completed == "yes":
+            break
+
+        # Continue generation
+        cont_prompt = CONTINUE_TOC_PROMPT.format(raw=toc_raw[:3000], partial=extracted)
+        continuation, _ = await _llm_with_finish_reason(cont_prompt, max_tokens=1500, json_mode=False)
+        extracted = extracted + "\n" + continuation
+
+    return extracted
+
+
+async def _llm_with_finish_reason(prompt: str, max_tokens: int = 1024, json_mode: bool = True) -> tuple[str, str]:
+    """LLM call that also returns finish_reason."""
+    max_tokens = min(max_tokens, 4096)
+    tried: set[int] = set()
+
+    for _ in range(len(GROQ_KEYS) + 1):
+        idx, key = await _next_key()
+        if idx in tried and len(tried) >= len(GROQ_KEYS):
+            raise HTTPException(status_code=429, detail="All Groq keys rate-limited")
+        tried.add(idx)
+
+        payload = {
+            "model": "llama-3.3-70b-versatile",
+            "messages": [
+                {"role": "system", "content": "You are an expert document analyst."},
+                {"role": "user", "content": prompt},
+            ],
+            "temperature": 0.1,
+            "max_tokens": max_tokens,
+        }
+        if json_mode:
+            payload["response_format"] = {"type": "json_object"}
+
+        async with httpx.AsyncClient(timeout=120) as client:
+            resp = await client.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+                json=payload,
+            )
+
+        if resp.status_code == 429:
+            await asyncio.sleep(1)
+            continue
+
+        data = resp.json()
+        if "error" in data:
+            continue
+
+        choice = data["choices"][0]
+        content = choice["message"]["content"].strip()
+        finish = choice.get("finish_reason", "stop")
+        finish_mapped = "finished" if finish in ("stop", "eos") else finish
+        return content, finish_mapped
+
+    raise HTTPException(status_code=429, detail="All Groq keys exhausted")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Stage 3: TOC → Structured JSON
+# ─────────────────────────────────────────────────────────────────────────────
+
+TOC_TRANSFORM_PROMPT = """Transform the following table of contents into a JSON array.
+
+'structure' is the numeric hierarchy: "1", "1.1", "1.2.3" etc.
+If a section has no numeric prefix, use sequential numbers.
+
+Return JSON:
+{{
+  "table_of_contents": [
+    {{"structure": "1", "title": "Introduction", "page": 1}},
+    {{"structure": "1.1", "title": "Background", "page": 2}},
+    ...
+  ]
+}}
+
+Table of contents:
+{toc_text}"""
+
+
+async def toc_to_json(toc_text: str) -> list[dict]:
+    """Convert raw cleaned TOC text into structured flat JSON list with multi-pass retry."""
+    prompt = TOC_TRANSFORM_PROMPT.format(toc_text=toc_text[:3000])
+    raw, finish = await _llm_with_finish_reason(prompt, max_tokens=3000, json_mode=True)
+
+    parsed = extract_json(raw)
+    items = []
+    if isinstance(parsed, dict) and "table_of_contents" in parsed:
+        items = parsed["table_of_contents"]
+    elif isinstance(parsed, list):
+        items = parsed
+
+    # Verify completeness
+    verify_prompt = f"""Is the following cleaned table of contents complete relative to the raw?
+Raw:
+{toc_text[:2000]}
+
+Cleaned (JSON):
+{json.dumps(items[:30], indent=2)}
+
+Return JSON: {{"thinking": "<reason>", "completed": "yes or no"}}"""
+
+    verify_raw = await llm_call(verify_prompt, max_tokens=200)
+    verify = extract_json(verify_raw)
+
+    if isinstance(verify, dict) and verify.get("completed") == "no" and len(items) > 0:
+        # Continue from last item
+        last = items[-1]
+        cont_prompt = f"""Continue the JSON table of contents array from after this entry:
+{json.dumps(last)}
+
+Raw TOC for reference:
+{toc_text[:3000]}
+
+Output ONLY the additional JSON array items (not the already-extracted ones), as a JSON array."""
+        cont_raw, _ = await _llm_with_finish_reason(cont_prompt, max_tokens=2000, json_mode=False)
+        try:
+            m = re.search(r"\[.*\]", cont_raw, re.DOTALL)
+            if m:
+                extra = json.loads(m.group())
+                if isinstance(extra, list):
+                    items.extend(extra)
+        except Exception:
+            pass
+
+    # Normalise: ensure page is int or None
+    for item in items:
+        try:
+            item["page"] = int(item.get("page") or 0) or None
+        except (ValueError, TypeError):
+            item["page"] = None
+
+    return items
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Stage 4: Assign Physical Indices
+# ─────────────────────────────────────────────────────────────────────────────
+
+ASSIGN_INDEX_PROMPT = """You are given a table of contents entry and several document pages.
+Find which physical page this section starts on.
+
+Section title: {title}
+TOC page number: {page}
+
+Document pages (search these):
+{pages}
+
+Return JSON:
+{{"thinking": "<which page contains the start of this section>",
+  "physical_index": <number or null>}}"""
+
+
+async def assign_physical_indices(
+    toc_items: list[dict], page_list: list[tuple[str, int]], total_pages: int
+) -> list[dict]:
+    """
+    For each TOC item, verify and confirm physical page index by checking actual page text.
+    Uses the TOC page number as the starting hint, scans ±3 pages around it.
+    """
+
+    async def _assign(item: dict) -> dict:
+        toc_page = item.get("page")
+        if toc_page is None:
+            item["physical_index"] = None
+            return item
+
+        # Scan ±3 pages around the TOC-stated page
+        search_start = max(1, toc_page - 1)
+        search_end = min(total_pages, toc_page + 3)
+        pages_text = get_page_content_by_range(page_list, search_start, search_end)
+
+        if not pages_text.strip():
+            item["physical_index"] = toc_page
+            return item
+
+        prompt = ASSIGN_INDEX_PROMPT.format(
+            title=item.get("title", ""),
+            page=toc_page,
+            pages=pages_text[:2500],
+        )
+        raw = await llm_call(prompt, max_tokens=200)
+        parsed = extract_json(raw)
+        if isinstance(parsed, dict):
+            pi = parsed.get("physical_index")
+            try:
+                item["physical_index"] = int(pi) if pi is not None else toc_page
+            except (ValueError, TypeError):
+                item["physical_index"] = toc_page
+        else:
+            item["physical_index"] = toc_page
+        return item
+
+    results = await asyncio.gather(*[_assign(item) for item in toc_items])
+    return list(results)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Stage 5: Build Nested Tree with start_index / end_index
+# ─────────────────────────────────────────────────────────────────────────────
+
+def build_tree_from_flat(items: list[dict], total_pages: int) -> list[dict]:
+    """
+    Convert flat TOC list into nested tree.
+    Each node: title, node_id, start_index, end_index, summary(placeholder), nodes.
+    end_index = next sibling's start_index - 1 (or total_pages for last).
+    """
+
+    def parse_depth(structure: str) -> int:
+        if not structure:
+            return 1
+        return len(structure.split("."))
+
+    # Sort by structure to ensure proper ordering
+    try:
+        items = sorted(items, key=lambda x: [int(p) for p in (x.get("structure") or "0").split(".")])
+    except Exception:
+        pass
+
+    # Assign end_index: for each item, end = next item's physical_index - 1
+    for i, item in enumerate(items):
+        start = item.get("physical_index") or item.get("page") or 1
+        if i + 1 < len(items):
+            next_start = items[i + 1].get("physical_index") or items[i + 1].get("page") or (start + 1)
+            end = max(start, next_start - 1)
+        else:
+            end = total_pages
+        item["_start"] = start
+        item["_end"] = end
+
+    # Build nested structure using a stack
+    root: list[dict] = []
+    stack: list[tuple[int, list[dict]]] = [(0, root)]  # (depth, children_list)
+    node_counters: dict[str, int] = {}
+
+    for item in items:
+        depth = parse_depth(item.get("structure", ""))
+        title = item.get("title", "Untitled")
+        start = item["_start"]
+        end = item["_end"]
+
+        # Generate node_id
+        parent_id = stack[-1][1][-1]["node_id"] if stack[-1][1] else ""
+        counter_key = f"depth_{depth}"
+        node_counters[counter_key] = node_counters.get(counter_key, 0) + 1
+        node_id = f"{node_counters[counter_key]:04d}" if depth == 1 else f"{parent_id}_{node_counters[counter_key]:02d}"
+
+        node = {
+            "node_id": node_id,
+            "title": title,
+            "start_index": start,
+            "end_index": end,
+            "summary": "",  # filled by Stage 6
+            "nodes": [],
+        }
+
+        # Pop stack to correct parent depth
+        while len(stack) > 1 and stack[-1][0] >= depth:
+            stack.pop()
+
+        stack[-1][1].append(node)
+        stack.append((depth, node["nodes"]))
+
+    return root
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Stage 6: Per-Node Summary Generation (concurrent)
+# ─────────────────────────────────────────────────────────────────────────────
+
+SUMMARY_PROMPT = """Read the following document section and write a 1-2 sentence summary of what it covers.
+Be concise (under 200 chars). Do NOT include quotes or raw data from the text.
+Example: "Covers thermal decomposition of H2O2 catalysts and reaction kinetics."
+
+Section title: {title}
+Section text (first 1500 chars):
+{text}
+
+Return JSON: {{"summary": "<your summary>"}}"""
+
+
+async def add_node_summaries(tree: list[dict], page_list: list[tuple[str, int]]) -> list[dict]:
+    """Recursively collect all nodes, generate summaries concurrently."""
+
+    def collect_nodes(nodes: list[dict]) -> list[dict]:
+        flat = []
+        for n in nodes:
+            flat.append(n)
+            if n.get("nodes"):
+                flat.extend(collect_nodes(n["nodes"]))
+        return flat
+
+    all_nodes = collect_nodes(tree)
+
+    async def _summarise(node: dict) -> None:
+        text = get_page_content_by_range(page_list, node["start_index"], min(node["start_index"] + 1, node["end_index"]))
+        if not text.strip():
+            node["summary"] = f"Section: {node['title']}"
+            return
+        prompt = SUMMARY_PROMPT.format(title=node["title"], text=text[:1500])
+        raw = await llm_call(prompt, max_tokens=150)
+        parsed = extract_json(raw)
+        node["summary"] = parsed.get("summary", node["title"]) if isinstance(parsed, dict) else node["title"]
+
+    await asyncio.gather(*[_summarise(n) for n in all_nodes])
+    return tree
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Stage 7: Per-Node Page Verification (concurrent)
+# ─────────────────────────────────────────────────────────────────────────────
+
+VERIFY_PAGE_PROMPT = """Check if the section titled "{title}" appears or starts on the given page.
+Do fuzzy matching — ignore minor spacing differences.
+
+Page text:
+{page_text}
+
+Return JSON: {{"thinking": "<reason>", "answer": "yes or no"}}"""
+
+
+async def verify_node_pages(tree: list[dict], page_list: list[tuple[str, int]], total_pages: int) -> list[dict]:
+    """
+    Concurrently verify each node's start_index against actual page text.
+    If wrong, scan ±2 pages and correct it.
+    """
+
+    def collect_nodes(nodes: list[dict]) -> list[dict]:
+        flat = []
+        for n in nodes:
+            flat.append(n)
+            if n.get("nodes"):
+                flat.extend(collect_nodes(n["nodes"]))
+        return flat
+
+    page_map = {phys: text for text, phys in page_list}
+
+    async def _verify(node: dict) -> None:
+        si = node.get("start_index", 1)
+        page_text = page_map.get(si, "")
+        if not page_text.strip():
+            return
+
+        prompt = VERIFY_PAGE_PROMPT.format(title=node["title"], page_text=page_text[:1500])
+        raw = await llm_call(prompt, max_tokens=150)
+        parsed = extract_json(raw)
+        answer = parsed.get("answer", "yes") if isinstance(parsed, dict) else "yes"
+
+        if answer != "yes":
+            # Scan ±2 pages
+            for delta in [-1, 1, -2, 2]:
+                candidate = si + delta
+                if candidate < 1 or candidate > total_pages:
+                    continue
+                alt_text = page_map.get(candidate, "")
+                if not alt_text:
+                    continue
+                prompt2 = VERIFY_PAGE_PROMPT.format(title=node["title"], page_text=alt_text[:1500])
+                raw2 = await llm_call(prompt2, max_tokens=150)
+                p2 = extract_json(raw2)
+                if isinstance(p2, dict) and p2.get("answer") == "yes":
+                    node["start_index"] = candidate
+                    break
+
+    all_nodes = collect_nodes(tree)
+    await asyncio.gather(*[_verify(n) for n in all_nodes])
+    return tree
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Fallback: No-TOC page-by-page structure extraction
+# ─────────────────────────────────────────────────────────────────────────────
+
+NO_TOC_INIT_PROMPT = """You are an expert in extracting hierarchical structure from documents.
+Read the following pages and extract the sections/headings you find.
+
+The tags <physical_index_X> mark page boundaries.
+
+Return a JSON array:
+[
+  {{"structure": "1", "title": "Section Title", "physical_index": <page number>}},
+  ...
+]
+Only return sections found in the provided pages.
+
+Document pages:
+{pages}"""
+
+NO_TOC_CONTINUE_PROMPT = """You are continuing to extract sections from a document.
+Here is the structure found so far, and the next set of pages to process.
+Continue the structure — add sections found in the new pages.
+
+Previous structure:
+{previous}
+
+New pages:
+{pages}
+
+Return ONLY the NEW sections as a JSON array (not the already-found ones):
+[
+  {{"structure": "<x.x.x>", "title": "...", "physical_index": <page number>}},
+  ...
+]"""
+
+
+async def extract_structure_no_toc(page_list: list[tuple[str, int]], chunk_size: int = 8) -> list[dict]:
+    """
+    Fallback for documents without a formal TOC.
+    Scans pages in chunks of `chunk_size`, building tree incrementally.
+    """
+    all_items: list[dict] = []
+    total = len(page_list)
+
+    for chunk_start in range(0, total, chunk_size):
+        chunk = page_list[chunk_start: chunk_start + chunk_size]
+        pages_text = "\n\n".join(
+            f"<physical_index_{phys}>\n{text}\n<physical_index_{phys}>" for text, phys in chunk if text.strip()
+        )
+
+        if not pages_text.strip():
+            continue
+
+        if not all_items:
+            prompt = NO_TOC_INIT_PROMPT.format(pages=pages_text[:3500])
+        else:
+            prompt = NO_TOC_CONTINUE_PROMPT.format(
+                previous=json.dumps(all_items[-10:], indent=2),
+                pages=pages_text[:3000],
+            )
+
+        raw, _ = await _llm_with_finish_reason(prompt, max_tokens=2000, json_mode=False)
+
+        parsed = extract_json(raw)
+        if isinstance(parsed, list):
+            all_items.extend(parsed)
+        elif isinstance(parsed, dict):
+            for v in parsed.values():
+                if isinstance(v, list):
+                    all_items.extend(v)
+                    break
+
+    # Normalize physical_index
+    for item in all_items:
+        pi = item.get("physical_index")
+        try:
+            item["physical_index"] = int(str(pi).split("_")[-1].rstrip(">").strip()) if pi else None
+        except Exception:
+            item["physical_index"] = None
+        item.setdefault("page", item.get("physical_index"))
+
+    return all_items
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tree utilities
+# ─────────────────────────────────────────────────────────────────────────────
 
 def count_nodes(nodes: list) -> int:
     c = 0
@@ -166,42 +740,55 @@ def count_nodes(nodes: list) -> int:
     return c
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Request / Response models
+# ─────────────────────────────────────────────────────────────────────────────
+
 class UploadRequest(BaseModel):
     file_url: str
     file_name: Optional[str] = "document.pdf"
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Endpoints
+# ─────────────────────────────────────────────────────────────────────────────
 
 @app.get("/health")
 def health():
     return {
         "status": "ok",
         "model": "llama-3.3-70b-versatile via Groq",
-        "approach": "PageIndex — tree is navigation only, raw_text is content store",
-        "mode": "stateless — stores nothing"
+        "groq_keys_loaded": len(GROQ_KEYS),
+        "approach": "PageIndex — multi-pass TOC extraction + per-node verification",
     }
 
 
 @app.post("/doc/")
 async def build_document_tree(
     req: UploadRequest,
-    x_api_key: str = Header(...)
+    x_api_key: str = Header(...),
 ):
     """
-    PageIndex tree building:
-    1. Extract full PDF text with [PAGE N] markers → stored as raw_text
-    2. Build navigation tree from TOC (titles + short descriptions only)
-    3. NO page_content embedded in tree — raw_text is the content store
-    4. At query time, tree search picks node_ids → page_index → raw_text fetch
+    Full PageIndex pipeline:
+    1. Download / decode PDF
+    2. Extract all pages with physical indices
+    3. Detect TOC pages via LLM (concurrent)
+    4. If TOC found: extract with multi-pass retry → transform to JSON → assign physical indices
+       If no TOC: page-by-page fallback extraction
+    5. Build nested tree with start_index + end_index
+    6. Generate per-node summaries (concurrent)
+    7. Verify per-node page indices (concurrent)
+    8. Return tree + raw_text
     """
     verify_key(x_api_key)
 
-    if not os.getenv("GROQ_API_KEY"):
-        raise HTTPException(status_code=500, detail="GROQ_API_KEY not set")
+    if not GROQ_KEYS:
+        raise HTTPException(status_code=500, detail="No Groq API keys configured")
 
+    # ── Download PDF ────────────────────────────────────────────────────────
     if req.file_url.startswith("data:"):
-        # Data URI — decode base64 payload directly
         try:
-            header, encoded = req.file_url.split(",", 1)
+            _, encoded = req.file_url.split(",", 1)
             pdf_bytes = base64.b64decode(encoded)
         except Exception as e:
             raise HTTPException(status_code=400, detail=f"Invalid data URI: {e}")
@@ -213,109 +800,82 @@ async def build_document_tree(
             if "text/html" in r.headers.get("content-type", ""):
                 raise HTTPException(
                     status_code=400,
-                    detail="URL returned HTML. For Google Drive use: https://drive.google.com/uc?export=download&id=FILE_ID"
+                    detail="URL returned HTML. For Google Drive use: https://drive.google.com/uc?export=download&id=FILE_ID",
                 )
             pdf_bytes = r.content
 
-    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
-        tmp.write(pdf_bytes)
-        tmp_path = tmp.name
-
+    tmp_path = None
     try:
-        raw_text, total_pages = extract_pdf_text(tmp_path)
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+            tmp.write(pdf_bytes)
+            tmp_path = tmp.name
+
+        # ── Extract pages ────────────────────────────────────────────────────
+        page_list, total_pages = extract_pdf_pages(tmp_path)
+        raw_text = get_raw_text(page_list)
+
         if not raw_text.strip():
-            raise HTTPException(status_code=400, detail="No text extracted from PDF")
+            raise HTTPException(status_code=400, detail="No text extracted from PDF — may be scanned/image-only")
 
-        toc_text = extract_toc_pages(raw_text)
-        first_chapter_text = get_page_content(raw_text, 18, pages=3)
+        # ── Stage 1: Detect TOC ──────────────────────────────────────────────
+        toc_pages = await detect_toc_pages(page_list, check_up_to=min(20, total_pages))
+        has_toc = len(toc_pages) > 0
+        print(f"[PageIndex] TOC detected on pages: {toc_pages}")
 
-        # Detect front-matter offset
-        offset = detect_page_offset(raw_text, toc_chapter1_page=1)
+        if has_toc:
+            # ── Stage 2: Extract TOC text ────────────────────────────────────
+            toc_raw_text = "\n\n".join(
+                page_list[phys - 1][0] for phys in toc_pages if 0 < phys <= total_pages
+            )
+            toc_cleaned = await extract_toc_with_retry(toc_raw_text)
 
-        prompt = f"""You are implementing the PageIndex document indexing framework.
+            # ── Stage 3: TOC → structured JSON ──────────────────────────────
+            toc_items = await toc_to_json(toc_cleaned)
+            print(f"[PageIndex] TOC items extracted: {len(toc_items)}")
 
-Document: {req.file_name}
-Total pages: {total_pages}
-Detected front-matter offset: {offset} pages (roman numeral pages before Chapter 1)
+            # ── Stage 4: Assign physical indices ────────────────────────────
+            toc_items = await assign_physical_indices(toc_items, page_list, total_pages)
 
-=== TABLE OF CONTENTS (extracted from document) ===
-{toc_text}
-
-=== START OF CHAPTER 1 (for page number calibration) ===
-{first_chapter_text[:2000]}
-
-Build a COMPLETE hierarchical navigation tree following the EXACT structure from the Table of Contents.
-
-CRITICAL RULES:
-1. Every chapter must appear as a top-level node with ALL its sections as children
-2. Every numbered section (1.1, 1.2, 2.3.1 etc) must appear as child/grandchild node
-3. page_index: use EXACTLY the page numbers printed in TOC — do NOT add any offset
-4. text: 1-2 sentence description of what that section covers — this is used for navigation.
-   Keep it SHORT (under 200 chars). Do NOT include actual page content, quotes, or data.
-   Example good text: "Covers thermal and catalytic decomposition reactions of H2O2."
-   Example bad text: "H2O2 → H2O + 1/2O2. The enthalpy is -136.11 kJ/mol..."
-5. nodes: must contain ALL child sections from TOC — never use empty array if subsections exist
-6. node_id: "0001" top level, "0001_01" children, "0001_01_01" grandchildren
-7. ONLY include these 5 fields per node: title, node_id, page_index, text, nodes
-   DO NOT add: page_content, content, description, summary, raw_text, or any other field
-
-Return a JSON object with a single "tree" key:
-{{
-  "tree": [
-    {{
-      "title": "Chapter 1 - Introduction",
-      "node_id": "0001",
-      "page_index": 1,
-      "text": "Introduces spacecraft propulsion, green propellants, and catalysts overview.",
-      "nodes": [
-        {{
-          "title": "1.1 Background",
-          "node_id": "0001_01",
-          "page_index": 1,
-          "text": "Overview of spacecraft engine types and the role of propulsion catalysts.",
-          "nodes": []
-        }}
-      ]
-    }}
-  ]
-}}"""
-
-        raw = call_groq(prompt)
-        parsed = json.loads(raw)
-
-        if isinstance(parsed, dict) and "tree" in parsed:
-            tree = parsed["tree"]
-        elif isinstance(parsed, list):
-            tree = parsed
         else:
-            for v in parsed.values():
-                if isinstance(v, list):
-                    tree = v
-                    break
-            else:
-                raise ValueError(f"Unexpected response shape: {list(parsed.keys())}")
+            # ── Fallback: no-TOC page-by-page ───────────────────────────────
+            print("[PageIndex] No TOC found — falling back to page-by-page extraction")
+            toc_items = await extract_structure_no_toc(page_list)
+            print(f"[PageIndex] Fallback items extracted: {len(toc_items)}")
 
-        # Clean tree — strip any page_content or extra fields LLM may have added
-        # This enforces the PageIndex principle: tree = navigation only
-        tree = clean_tree(tree)
+        if not toc_items:
+            raise HTTPException(status_code=500, detail="Failed to extract any structure from the document")
+
+        # ── Stage 5: Build tree ──────────────────────────────────────────────
+        tree = build_tree_from_flat(toc_items, total_pages)
+
+        # ── Stage 6: Summaries ───────────────────────────────────────────────
+        tree = await add_node_summaries(tree, page_list)
+
+        # ── Stage 7: Verify pages ────────────────────────────────────────────
+        tree = await verify_node_pages(tree, page_list, total_pages)
 
         doc_id = f"pi-{uuid.uuid4().hex[:16]}"
 
         return {
             "doc_id": doc_id,
             "file_name": req.file_name,
-            "tree": tree,           # navigation index only — no page content
-            "raw_text": raw_text,   # content store — fetched by page_index at query time
+            "tree": tree,
+            "raw_text": raw_text,
             "tree_node_count": count_nodes(tree),
             "top_level_nodes": len(tree),
             "total_pages": total_pages,
-            "page_offset_detected": offset,
-            "status": "completed"
+            "toc_found": has_toc,
+            "toc_pages": toc_pages,
+            "status": "completed",
         }
 
-    except json.JSONDecodeError as e:
-        raise HTTPException(status_code=500, detail=f"JSON parse error: {str(e)}")
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Pipeline error: {str(e)}")
     finally:
-        os.unlink(tmp_path)
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
