@@ -141,6 +141,40 @@ def get_page_content(raw_text: str, page_index: int, pages: int = 3) -> str:
     return content.strip()
 
 
+def detect_page_offset(raw_text: str, toc_chapter1_page: int = 1) -> int:
+    """
+    Academic PDFs have roman numeral front matter (abstract, TOC, etc.)
+    that shifts all chapter page numbers. The TOC says "Chapter 1 = page 1"
+    but in the PDF it might be [PAGE 18].
+
+    Strategy: find the first real chapter heading in raw_text, get its
+    [PAGE N] number, subtract the TOC page number to get the offset.
+
+    e.g. Chapter 1 at [PAGE 18] with TOC saying page 1 → offset = 17
+    """
+    # Look for CHAPTER heading markers
+    patterns = [
+        r'\[PAGE (\d+)\]\s*\n.*?Chapter\s+1\b',
+        r'\[PAGE (\d+)\]\s*\n\s*1\s*\n.*?INTRODUCTION',
+        r'\[PAGE (\d+)\]\s*\n.*?INTRODUCTION',
+        r'\[PAGE (\d+)\]\s*\n\s*Chapter\s+1',
+    ]
+    for pattern in patterns:
+        m = re.search(pattern, raw_text, re.IGNORECASE | re.DOTALL)
+        if m:
+            pdf_page = int(m.group(1))
+            offset = pdf_page - toc_chapter1_page
+            return max(0, offset)
+
+    # Fallback: count pages with roman numeral content before arabic page 1
+    # Find where "1 " appears as a page marker in text (indicating page 1 of main text)
+    roman_pages = re.findall(r'\[PAGE (\d+)\]\n[ivxlcdmIVXLCDM]+\s', raw_text)
+    if roman_pages:
+        return len(roman_pages)
+
+    return 0  # No offset detected
+
+
 def flatten_tree(nodes: list) -> list:
     """Flatten nested tree to list."""
     result = []
@@ -151,14 +185,20 @@ def flatten_tree(nodes: list) -> list:
     return result
 
 
-def enrich_summaries(tree: list, raw_text: str) -> list:
-    """Add real page content as page_content field to each node."""
+def enrich_summaries(tree: list, raw_text: str, offset: int = 0) -> list:
+    """
+    Add real page content to each node using corrected PDF page numbers.
+
+    offset: difference between PDF page numbers and TOC page numbers
+    e.g. if TOC says "page 1" but PDF has [PAGE 18], offset = 17
+    """
     for node in tree:
-        page = node.get("page_index", 1)
-        content = get_page_content(raw_text, page, pages=2)
+        toc_page = node.get("page_index", 1)
+        pdf_page = toc_page + offset
+        content = get_page_content(raw_text, pdf_page, pages=2)
         node["page_content"] = content[:1500] if content else node.get("text", "")
         if node.get("nodes"):
-            node["nodes"] = enrich_summaries(node["nodes"], raw_text)
+            node["nodes"] = enrich_summaries(node["nodes"], raw_text, offset)
     return tree
 
 
@@ -248,9 +288,9 @@ Build a COMPLETE hierarchical tree index following the EXACT structure from the 
 CRITICAL RULES:
 1. Every chapter in the TOC must appear as a top-level node with all its sections as child nodes
 2. Every numbered section (1.1, 1.2, 2.3.1 etc) must appear as a child or grandchild node
-3. page_index: use the page numbers shown in the TOC (convert roman numerals: Chapter 1 starts at page 1 of main text = PDF page 18 based on sample above)
-4. text: 1-2 sentence description of what that section covers
-5. nodes: must contain all child sections — NEVER leave nodes as empty array if TOC shows subsections exist
+3. page_index: use EXACTLY the page numbers shown in the TOC — do NOT add any offset, use the numbers as printed
+4. text: 1-2 sentence description of what that section covers based on the title
+5. nodes: must contain ALL child sections listed in the TOC — NEVER use empty array if TOC shows subsections
 6. node_id: "0001" for top level, "0001_01" for children, "0001_01_01" for grandchildren
 
 Return a JSON object with a single "tree" key containing the array:
@@ -298,8 +338,12 @@ Return a JSON object with a single "tree" key containing the array:
             else:
                 raise ValueError(f"Unexpected response shape: {list(parsed.keys())}")
 
-        # Enrich with actual page content from raw_text
-        tree = enrich_summaries(tree, raw_text)
+        # Detect front-matter offset (roman numeral pages before Chapter 1)
+        # e.g. thesis with 17 roman-numeral pages → offset=17, so TOC "page 1" = PDF [PAGE 18]
+        offset = detect_page_offset(raw_text, toc_chapter1_page=1)
+
+        # Enrich with actual page content using corrected PDF page numbers
+        tree = enrich_summaries(tree, raw_text, offset)
 
         doc_id = f"pi-{uuid.uuid4().hex[:16]}"
 
@@ -311,6 +355,7 @@ Return a JSON object with a single "tree" key containing the array:
             "tree_node_count": count_nodes(tree),
             "top_level_nodes": len(tree),
             "total_pages": total_pages,
+            "page_offset_detected": offset,
             "status": "completed"
         }
 
