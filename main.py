@@ -8,7 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, List
 
-app = FastAPI(title="PageIndex Self-Hosted — Mistral + Open Source Tree")
+app = FastAPI(title="PageIndex Self-Hosted — Mistral")
 
 app.add_middleware(
     CORSMiddleware,
@@ -17,18 +17,15 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# In-memory store: doc_id -> {tree, file_name, status, raw_text}
 DOC_STORE = {}
 
 
-# ── Auth ─────────────────────────────────────────────────────
 def verify_key(x_api_key: str):
     expected = os.getenv("SERVER_API_KEY", "")
     if expected and x_api_key != expected:
         raise HTTPException(status_code=401, detail="Invalid API key")
 
 
-# ── Mistral client (OpenAI-compatible) ───────────────────────
 def mistral():
     import openai
     return openai.OpenAI(
@@ -37,9 +34,7 @@ def mistral():
     )
 
 
-# ── PDF text extraction ──────────────────────────────────────
 def extract_pdf_text(pdf_path: str) -> str:
-    """Extract text from PDF preserving page structure."""
     import pypdf
     reader = pypdf.PdfReader(pdf_path)
     pages = []
@@ -50,25 +45,14 @@ def extract_pdf_text(pdf_path: str) -> str:
     return "\n\n".join(pages)
 
 
-# ── Build tree (PageIndex approach via Mistral) ──────────────
 def build_tree(text: str, file_name: str) -> list:
-    """
-    Build a hierarchical tree index from document text using Mistral.
-    This replicates what PageIndex open-source does:
-    - Analyse the document structure
-    - Create a TOC-style tree with sections and subsections
-    - Each node has title, node_id, page_index, text summary
-    """
     client = mistral()
-
-    # Truncate to avoid token limits — use first 12000 chars for tree building
     sample_text = text[:12000]
-
-    prompt = f"""You are a document analysis expert. Analyse this document and create a hierarchical tree index (like a detailed Table of Contents) optimised for RAG retrieval.
+    prompt = f"""You are a document analysis expert. Analyse this document and create a hierarchical tree index like a detailed Table of Contents optimised for RAG retrieval.
 
 Document: {file_name}
 
-Document text (first portion):
+Document text:
 {sample_text}
 
 Return ONLY a valid JSON array. Each node must have:
@@ -79,7 +63,7 @@ Return ONLY a valid JSON array. Each node must have:
 - "nodes": array of child nodes (can be empty array)
 
 Return a maximum of 15 top-level nodes with up to 3 children each.
-Return ONLY the JSON array, no other text."""
+Return ONLY the JSON array, no markdown, no explanation."""
 
     response = client.chat.completions.create(
         model="mistral-small-latest",
@@ -87,33 +71,25 @@ Return ONLY the JSON array, no other text."""
         max_tokens=3000,
         temperature=0.1
     )
-
     raw = response.choices[0].message.content.strip()
-
-    # Strip markdown code fences if present
     if raw.startswith("```"):
         raw = raw.split("```")[1]
         if raw.startswith("json"):
             raw = raw[4:]
     raw = raw.strip()
-
-    tree = json.loads(raw)
-    return tree
+    return json.loads(raw)
 
 
-# ── Tree search (PageIndex reasoning-based retrieval) ────────
 def search_tree(tree: list, query: str, raw_text: str) -> list:
-    """
-    Reasoning-based retrieval: Mistral reasons over the tree
-    to find the most relevant nodes, then fetches their content.
-    This is the core PageIndex approach — no vector similarity.
-    """
     client = mistral()
-
     tree_summary = json.dumps([
-        {"node_id": n.get("node_id"), "title": n.get("title"),
-         "page": n.get("page_index"), "summary": n.get("text", "")[:200],
-         "children": [c.get("title") for c in n.get("nodes", [])]}
+        {
+            "node_id": n.get("node_id"),
+            "title": n.get("title"),
+            "page": n.get("page_index"),
+            "summary": n.get("text", "")[:200],
+            "children": [c.get("title") for c in n.get("nodes", [])]
+        }
         for n in tree
     ], indent=2)
 
@@ -124,10 +100,10 @@ Query: {query}
 Document tree index:
 {tree_summary}
 
-Which node_ids are most relevant to answer the query? 
-Reason step by step over the tree structure, then return ONLY a JSON array of the 2-3 most relevant node_ids.
+Which node_ids are most relevant to answer this query?
+Reason step by step over the tree, then return ONLY a JSON array of 2-3 most relevant node_ids.
 Example: ["0003", "0007"]
-Return ONLY the JSON array."""
+Return ONLY the JSON array, no explanation."""
 
     response = client.chat.completions.create(
         model="mistral-small-latest",
@@ -135,17 +111,14 @@ Return ONLY the JSON array."""
         max_tokens=200,
         temperature=0.1
     )
-
     raw = response.choices[0].message.content.strip()
     if raw.startswith("```"):
         raw = raw.split("```")[1]
         if raw.startswith("json"):
             raw = raw[4:]
     raw = raw.strip()
-
     selected_ids = json.loads(raw)
 
-    # Collect selected nodes from tree
     def find_nodes(nodes, ids):
         result = []
         for n in nodes:
@@ -156,7 +129,6 @@ Return ONLY the JSON array."""
 
     retrieved = find_nodes(tree, selected_ids)
 
-    # Enhance with raw page text
     for node in retrieved:
         page = node.get("page_index", 1)
         page_marker = f"[PAGE {page}]"
@@ -168,10 +140,10 @@ Return ONLY the JSON array."""
     return retrieved
 
 
-# ── Models ───────────────────────────────────────────────────
 class UploadRequest(BaseModel):
     file_url: str
     file_name: Optional[str] = "document.pdf"
+
 
 class QueryRequest(BaseModel):
     doc_id: str
@@ -179,12 +151,22 @@ class QueryRequest(BaseModel):
     messages: Optional[List[dict]] = []
 
 
-# ── Routes ───────────────────────────────────────────────────
+class DeleteRequest(BaseModel):
+    doc_id: str
+
+
+# ── HEALTH ───────────────────────────────────────────────────
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "provider": "mistral", "approach": "tree-based RAG"}
+    return {
+        "status": "ok",
+        "provider": "mistral",
+        "docs_in_memory": len(DOC_STORE)
+    }
 
+
+# ── FLOW 1: Upload document ──────────────────────────────────
 
 @app.post("/doc/")
 async def upload_document(
@@ -196,7 +178,6 @@ async def upload_document(
     if not os.getenv("MISTRAL_API_KEY"):
         raise HTTPException(status_code=500, detail="MISTRAL_API_KEY not set on server")
 
-    # Download PDF
     async with httpx.AsyncClient(timeout=60, follow_redirects=True) as client:
         r = await client.get(req.file_url)
         if r.status_code != 200:
@@ -219,7 +200,8 @@ async def upload_document(
             "tree": tree,
             "raw_text": raw_text,
             "file_name": req.file_name,
-            "status": "completed"
+            "status": "completed",
+            "tree_node_count": len(tree)
         }
         return {"doc_id": doc_id}
 
@@ -231,6 +213,8 @@ async def upload_document(
         os.unlink(tmp_path)
 
 
+# ── FLOW 1: Check status ─────────────────────────────────────
+
 @app.get("/doc/{doc_id}/")
 def get_status(doc_id: str, x_api_key: str = Header(...)):
     verify_key(x_api_key)
@@ -241,19 +225,11 @@ def get_status(doc_id: str, x_api_key: str = Header(...)):
         "doc_id": doc_id,
         "status": doc["status"],
         "retrieval_ready": True,
-        "tree_node_count": len(doc.get("tree", []))
+        "tree_node_count": doc.get("tree_node_count", 0)
     }
 
 
-@app.get("/doc/{doc_id}/tree")
-def get_tree(doc_id: str, x_api_key: str = Header(...)):
-    """Return the full tree structure — shows the PageIndex tree to the UI."""
-    verify_key(x_api_key)
-    doc = DOC_STORE.get(doc_id)
-    if not doc:
-        raise HTTPException(status_code=404, detail="Document not found")
-    return {"doc_id": doc_id, "tree": doc["tree"]}
-
+# ── FLOW 2: Chat with document ───────────────────────────────
 
 @app.post("/chat/completions")
 async def chat(
@@ -264,13 +240,11 @@ async def chat(
 
     doc = DOC_STORE.get(req.doc_id)
     if not doc:
-        raise HTTPException(status_code=404, detail="Document not found. Upload first.")
+        raise HTTPException(status_code=404, detail="Document not found. Upload first via POST /doc/")
 
     try:
-        # Step 1: Tree-based reasoning retrieval (the PageIndex approach)
         retrieved = search_tree(doc["tree"], req.query, doc["raw_text"])
 
-        # Step 2: Build context from retrieved nodes
         context_parts = []
         for node in retrieved:
             title = node.get("title", "")
@@ -279,7 +253,6 @@ async def chat(
             context_parts.append(f"[Section: {title} | Page: {page}]\n{content}")
         context = "\n\n---\n\n".join(context_parts)
 
-        # Step 3: Generate final answer with Mistral
         client = mistral()
         messages = [
             {
@@ -316,3 +289,49 @@ async def chat(
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ── FLOW 3: List all documents ───────────────────────────────
+
+@app.get("/docs/")
+def list_docs(x_api_key: str = Header(...)):
+    verify_key(x_api_key)
+    docs = []
+    for doc_id, doc in DOC_STORE.items():
+        docs.append({
+            "doc_id": doc_id,
+            "file_name": doc.get("file_name", "unknown"),
+            "status": doc.get("status", "unknown"),
+            "tree_node_count": doc.get("tree_node_count", 0)
+        })
+    return {
+        "documents": docs,
+        "total": len(docs)
+    }
+
+
+# ── FLOW 4: Get tree structure ───────────────────────────────
+
+@app.get("/doc/{doc_id}/tree")
+def get_tree(doc_id: str, x_api_key: str = Header(...)):
+    verify_key(x_api_key)
+    doc = DOC_STORE.get(doc_id)
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found")
+    return {
+        "doc_id": doc_id,
+        "file_name": doc.get("file_name", ""),
+        "tree": doc["tree"],
+        "tree_node_count": doc.get("tree_node_count", 0)
+    }
+
+
+# ── DELETE document ──────────────────────────────────────────
+
+@app.delete("/doc/{doc_id}/")
+def delete_doc(doc_id: str, x_api_key: str = Header(...)):
+    verify_key(x_api_key)
+    if doc_id not in DOC_STORE:
+        raise HTTPException(status_code=404, detail="Document not found")
+    del DOC_STORE[doc_id]
+    return {"deleted": True, "doc_id": doc_id}
