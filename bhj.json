@@ -1,0 +1,72 @@
+[
+    {
+        "text": "Contains the thesis title, author details, degree requirements, and institutional affiliations including supervisors from DIAT and Manastu Space Technology.",
+        "nodes": [],
+        "title": "Title Page",
+        "node_id": "0001",
+        "page_index": 1
+    },
+    {
+        "text": "A dedication page with a quote from Lord Parashuram and acknowledgment of family and Manastu Space.",
+        "nodes": [],
+        "title": "Dedication",
+        "node_id": "0002",
+        "page_index": 2
+    },
+    {
+        "text": "Official approval sheet signed by examiners, supervisor, HOD, and chairman for the award of the M.Sc. degree.",
+        "nodes": [],
+        "title": "Approval Sheet",
+        "node_id": "0003",
+        "page_index": 3
+    },
+    {
+        "text": "Certifies completion of 16 courses (48 credits) including dissertation work for the M.Sc. in Materials Science.",
+        "nodes": [],
+        "title": "Certificate of Coursework",
+        "node_id": "0004",
+        "page_index": 4
+    },
+    {
+        "text": "Author's declaration certifying originality, non-submission elsewhere, and no classified information in the thesis.",
+        "nodes": [],
+        "title": "Declaration",
+        "node_id": "0005",
+        "page_index": 5
+    },
+    {
+        "text": "Supervisor's certificate confirming the thesis work was conducted under guidance and meets academic standards.",
+        "nodes": [],
+        "title": "Certificate by Guide",
+        "node_id": "0006",
+        "page_index": 6
+    },
+    {
+        "text": "Certificates from Manastu Space Technology mentors (Henry Sam and Aditya Hon) attesting to the thesis work's originality and industrial relevance.",
+        "nodes": [],
+        "title": "Certificate by Industry Mentors",
+        "node_id": "0007",
+        "page_index": 7
+    },
+    {
+        "text": "Overview of Manastu Space Technologies, their mission, innovations in green propulsion, and proprietary MS-289 propellant.",
+        "nodes": [],
+        "title": "About the Company",
+        "node_id": "0008",
+        "page_index": 8
+    },
+    {
+        "text": "Extensive acknowledgments to academic and industry mentors, family, friends, and colleagues for their support during the thesis work.",
+        "nodes": [],
+        "title": "Acknowledgements",
+        "node_id": "0009",
+        "page_index": 9
+    },
+    {
+        "text": "Introduces the thesis focus on high-temperature catalyst engineering for monopropellant thrusters, highlighting lanthanum chromite (LaCrO3) as the chosen catalyst material.",
+        "nodes": [],
+        "title": "Abstract",
+        "node_id": "0010",
+        "page_index": 11
+    }
+]
