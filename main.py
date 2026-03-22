@@ -192,6 +192,8 @@ async def llm_call(
             data = resp.json()
             if "error" in data:
                 err = data["error"].get("message", str(data["error"]))
+                err_code = data["error"].get("code", "")
+
                 if "rate_limit" in err.lower() or "429" in err:
                     retry_after = float(
                         resp.headers.get("retry-after", str(backoff))
@@ -199,6 +201,36 @@ async def llm_call(
                     await asyncio.sleep(min(retry_after + random.uniform(0, 3), 60))
                     backoff = min(backoff * 1.5, 60)
                     continue
+
+                # failed_generation: Groq's JSON-constrained mode hit the token
+                # limit before it could close all JSON brackets.
+                # Fix: retry the SAME prompt without response_format=json_object,
+                # then let extract_json() parse the raw text output.
+                if err_code == "failed_generation" or "failed_generation" in err.lower():
+                    print(f"[PageIndex] failed_generation on attempt {attempt} — retrying without json_mode")
+                    payload_plain = {k: v for k, v in payload.items() if k != "response_format"}
+                    try:
+                        resp2 = await _http_client.post(
+                            "https://api.groq.com/openai/v1/chat/completions",
+                            headers={
+                                "Authorization": f"Bearer {key}",
+                                "Content-Type": "application/json",
+                            },
+                            json=payload_plain,
+                        )
+                        data2 = resp2.json()
+                        if "choices" in data2:
+                            content2 = data2["choices"][0]["message"]["content"].strip()
+                            if return_finish_reason:
+                                finish2 = data2["choices"][0].get("finish_reason", "stop")
+                                finish_mapped2 = "finished" if finish2 in ("stop", "eos") else finish2
+                                return content2, finish_mapped2
+                            return content2
+                    except Exception:
+                        pass
+                    backoff = min(backoff * 1.5, 60)
+                    continue
+
                 raise HTTPException(status_code=500, detail=f"Groq error: {err}")
 
             choice = data["choices"][0]
@@ -423,8 +455,10 @@ Table of contents:
 
 
 async def toc_to_json(toc_text: str) -> list[dict]:
-    prompt = TOC_TRANSFORM_PROMPT.format(toc_text=toc_text[:3000])
-    raw, _ = await llm_call(prompt, max_tokens=3000, json_mode=True, return_finish_reason=True)
+    # Cap input: 2000 chars ~= 60 lines ~= 1800 token output, safe under 4096
+    # 3000 chars was the main trigger of failed_generation on large TOCs
+    prompt = TOC_TRANSFORM_PROMPT.format(toc_text=toc_text[:2000])
+    raw, _ = await llm_call(prompt, max_tokens=2048, json_mode=True, return_finish_reason=True)
 
     parsed = extract_json(raw)
     items = []
