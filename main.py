@@ -322,40 +322,43 @@ def get_page_content_by_range(page_list: list, start: int, end: int) -> str:
 def _looks_like_toc_heuristic(text: str) -> bool:
     """
     Fast pre-filter before calling the LLM.
-    Returns True only if the page has structural indicators of a TOC.
-    Pages that fail this test are skipped entirely — no LLM call.
+    Intentionally lenient — false positives cost one LLM call,
+    false negatives are fatal (TOC page missed entirely).
     """
     if not text or len(text.strip()) < 30:
         return False
-    lines = [l.strip() for l in text.splitlines() if l.strip()]
-    if len(lines) < 3:
+    lines_list = [l.strip() for l in text.splitlines() if l.strip()]
+    if len(lines_list) < 3:
         return False
-    # Heuristic 1: many lines end with a number (page numbers)
-    ends_with_num = sum(1 for l in lines if re.search(r"\d+\s*$", l))
-    if ends_with_num / max(len(lines), 1) > 0.35:
+    # Heuristic 1: >=30% of lines end with a standalone number (page refs)
+    ends_with_num = sum(1 for l in lines_list if re.search(r"\s\d{1,4}\s*$", l))
+    if ends_with_num / max(len(lines_list), 1) >= 0.30:
         return True
-    # Heuristic 2: dotted leaders present
-    if text.count("...") > 3 or text.count("……") > 2:
+    # Heuristic 2: dotted leaders in any form pypdf might produce
+    if text.count("...") > 2 or text.count("\u2026\u2026") > 1 or text.count(". . .") > 1:
         return True
-    # Heuristic 3: "contents" or "table of" appears
-    lower = text.lower()
-    if "table of contents" in lower or "contents\n" in lower:
+    # Heuristic 3: the word "contents" anywhere (word-boundary, case-insensitive)
+    if re.search(r"\bcontents\b", text, re.IGNORECASE):
+        return True
+    # Heuristic 4: many short lines typical of TOC entries
+    short_lines = sum(1 for l in lines_list if len(l) < 60)
+    if short_lines / max(len(lines_list), 1) >= 0.70 and len(lines_list) >= 6:
         return True
     return False
 
 
 async def detect_toc_pages(
-    page_list: list[tuple[str, int]], check_up_to: int = 8  # FIX 6: was 20
+    page_list: list[tuple[str, int]], check_up_to: int = 8
 ) -> list[int]:
     candidates = page_list[:check_up_to]
 
-    # Pre-filter with fast heuristic — skip obviously non-TOC pages
-    # This eliminates LLM calls for pages that have no structural TOC signals
+    # Pre-filter with heuristic
     filtered = [(text, phys) for text, phys in candidates if _looks_like_toc_heuristic(text)]
 
     if not filtered:
-        # No heuristic hits — fall back to LLM on first 5 pages only
-        filtered = candidates[:5]
+        # Heuristic found nothing — send ALL candidates to LLM.
+        # Sending all 8 is safe (semaphore throttles); missing the TOC is not.
+        filtered = candidates
 
     prompts = []
     for text, phys in filtered:
@@ -804,6 +807,90 @@ async def extract_structure_no_toc(
 # Tree utilities
 # ─────────────────────────────────────────────────────────────────────────────
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Last-Resort Fallback: Regex heading extractor (zero LLM calls)
+# Runs only when both TOC detection AND no-TOC LLM extraction return empty.
+# Scans every page for lines that look like headings (short, title-cased or
+# numbered) and builds a flat structure from them.
+# Guarantees the pipeline never returns "Failed to extract any structure".
+# ─────────────────────────────────────────────────────────────────────────────
+
+def extract_structure_regex(page_list: list[tuple[str, int]], total_pages: int) -> list[dict]:
+    """
+    Pure-Python heading detector — no LLM, never fails.
+    Looks for lines matching common heading patterns:
+      - Numbered: "1.", "1.1", "Chapter 1", "Section 2.3"
+      - Short all-caps lines (typical chapter headings)
+      - Short Title Case lines at start of page
+    Returns flat list compatible with build_tree_from_flat().
+    """
+    heading_patterns = [
+        re.compile(r"^(Chapter|Section|Part|Appendix)\s+\d+", re.IGNORECASE),
+        re.compile(r"^\d+(\.\d+){0,2}\s+[A-Z][a-zA-Z\s]{3,60}$"),
+        re.compile(r"^\d+\.\s+[A-Z][a-zA-Z\s]{3,60}$"),
+    ]
+
+    items = []
+    structure_counters = [0, 0, 0]  # depth 1, 2, 3 counters
+
+    for text, phys in page_list:
+        if not text.strip():
+            continue
+        # Check first 5 non-empty lines of each page for heading patterns
+        page_lines = [l.strip() for l in text.splitlines() if l.strip()][:8]
+        for line in page_lines:
+            if len(line) < 3 or len(line) > 80:
+                continue
+            matched = False
+            for pat in heading_patterns:
+                if pat.match(line):
+                    matched = True
+                    break
+            if not matched:
+                # Short all-caps line (common chapter heading style)
+                if line.isupper() and 4 <= len(line) <= 60:
+                    matched = True
+            if matched:
+                # Determine depth from numbering (e.g. "1.2.3" = depth 3)
+                num_match = re.match(r"^(\d+)(\.(\d+))?(\.(\d+))?", line)
+                depth = 1
+                if num_match:
+                    if num_match.group(5):
+                        depth = 3
+                    elif num_match.group(3):
+                        depth = 2
+                # Build a structure string
+                structure_counters[depth - 1] += 1
+                if depth == 1:
+                    structure_counters[1] = 0
+                    structure_counters[2] = 0
+                    structure = str(structure_counters[0])
+                elif depth == 2:
+                    structure_counters[2] = 0
+                    structure = f"{structure_counters[0]}.{structure_counters[1]}"
+                else:
+                    structure = f"{structure_counters[0]}.{structure_counters[1]}.{structure_counters[2]}"
+
+                items.append({
+                    "structure": structure,
+                    "title": line,
+                    "page": phys,
+                    "physical_index": phys,
+                })
+                break  # one heading per page max at this level
+
+    # Deduplicate consecutive items on the same page
+    seen_pages = set()
+    unique_items = []
+    for item in items:
+        key = (item["page"], item["structure"].split(".")[0])
+        if key not in seen_pages:
+            seen_pages.add(key)
+            unique_items.append(item)
+
+    return unique_items
+
+
 def count_nodes(nodes: list) -> int:
     c = 0
     for n in nodes:
@@ -931,10 +1018,21 @@ async def build_document_tree(
             print(f"[PageIndex] Fallback items: {len(toc_items)}")
 
         if not toc_items:
-            raise HTTPException(
-                status_code=500,
-                detail="Failed to extract any structure from the document",
-            )
+            # Last-resort: regex heading extractor — pure Python, zero LLM calls.
+            # Scans every page for numbered/titled headings. Always returns something.
+            print("[PageIndex] Both LLM paths empty — using regex last-resort extractor")
+            toc_items = extract_structure_regex(page_list, total_pages)
+            print(f"[PageIndex] Regex fallback items: {len(toc_items)}")
+
+        if not toc_items:
+            # Absolute last resort: one node per page (document is always indexed)
+            print("[PageIndex] Regex also empty — creating page-per-node structure")
+            toc_items = [
+                {"structure": str(i + 1), "title": f"Page {phys}", "page": phys, "physical_index": phys}
+                for i, (text, phys) in enumerate(page_list)
+                if text.strip()
+            ]
+
 
         # ── Stage 5: Build tree (pure Python) ───────────────────────────────
         tree = build_tree_from_flat(toc_items, total_pages)
