@@ -634,13 +634,25 @@ def build_tree_from_flat(items: list[dict], total_pages: int) -> list[dict]:
         start = item["_start"]
         end = item["_end"]
 
-        parent_id = stack[-1][1][-1]["node_id"] if stack[-1][1] else ""
-        counter_key = f"depth_{depth}"
+        # Find parent node_id: walk the stack to find the nearest ancestor list
+        # that has at least one node in it. stack[-1] is current level.
+        # For depth==1 nodes, parent is root (no prefix). For depth>1, find
+        # the last node added to the nearest non-empty ancestor list.
+        parent_node_id = ""
+        if depth > 1:
+            for _d, _lst in reversed(stack):
+                if _lst:
+                    parent_node_id = _lst[-1]["node_id"]
+                    break
+
+        counter_key = f"depth_{depth}_{parent_node_id}"
         node_counters[counter_key] = node_counters.get(counter_key, 0) + 1
+        # Top-level: "0001", "0002" etc. Children: "0001_01", "0001_02" etc.
+        seq = node_counters[counter_key]
         node_id = (
-            f"{node_counters[counter_key]:04d}"
+            f"{seq:04d}"
             if depth == 1
-            else f"{parent_id}_{node_counters[counter_key]:02d}"
+            else f"{parent_node_id}_{seq:02d}"
         )
 
         node = {
@@ -658,6 +670,20 @@ def build_tree_from_flat(items: list[dict], total_pages: int) -> list[dict]:
         stack[-1][1].append(node)
         stack.append((depth, node["nodes"]))
 
+    # Post-process: ensure every parent's end_index >= all its children's end_index.
+    # The flat-list ordering sets end_index from the next sibling's start, which
+    # can be LESS than a child's end_index when children span more pages.
+    def fix_end_indices(nodes: list[dict]) -> int:
+        """Recursively fix end_index bottom-up. Returns max end_index seen."""
+        max_end = 0
+        for node in nodes:
+            if node.get("nodes"):
+                child_max = fix_end_indices(node["nodes"])
+                node["end_index"] = max(node["end_index"], child_max)
+            max_end = max(max_end, node["end_index"])
+        return max_end
+
+    fix_end_indices(root)
     return root
 
 
@@ -721,41 +747,53 @@ async def add_node_summaries(
 # Fallback: No-TOC page-by-page structure extraction (sequential — no gather)
 # ─────────────────────────────────────────────────────────────────────────────
 
-NO_TOC_INIT_PROMPT = """You are an expert in extracting hierarchical structure from documents.
-Read the following pages and extract sections/headings found.
-<physical_index_X> tags mark page boundaries.
+NO_TOC_INIT_PROMPT = """You are extracting the literal section headings from a document.
+
+STRICT RULES — follow exactly:
+1. ONLY extract headings that appear VERBATIM in the page text.
+2. DO NOT invent, summarize, or generalize. Copy the exact words from the page.
+3. Valid headings: numbered sections ("1. Introduction"), chapter titles, bold/prominent short lines, section labels.
+4. Invalid: body text sentences, captions, footnotes, page numbers.
+5. If a page has NO clear heading, do not add an entry for it.
+
+<physical_index_X> tags mark page boundaries. Use X as the physical_index value.
 
 Return a JSON array:
 [
-  {{"structure": "1", "title": "Section Title", "physical_index": <page number>}},
+  {{"structure": "1", "title": "EXACT heading text from page", "physical_index": <X>}},
   ...
 ]
-Only include sections found in the provided pages.
 
 Document pages:
 {pages}"""
 
-NO_TOC_CONTINUE_PROMPT = """Continue extracting sections. Add only NEW sections found in the new pages.
+NO_TOC_CONTINUE_PROMPT = """Continue extracting verbatim headings from the new pages only.
 
-Previous structure (last 10 entries):
+STRICT RULES:
+1. Copy heading text EXACTLY as it appears in the page — no paraphrasing.
+2. Skip pages with no clear headings.
+3. Do not repeat entries from the previous structure.
+
+Previous structure (last 10 entries for context):
 {previous}
 
 New pages:
 {pages}
 
-Return ONLY new sections as a JSON array:
+Return ONLY new entries as a JSON array:
 [
-  {{"structure": "<x.x.x>", "title": "...", "physical_index": <page number>}},
+  {{"structure": "<x.x.x>", "title": "EXACT heading from page", "physical_index": <X>}},
   ...
 ]"""
 
 
 async def extract_structure_no_toc(
-    page_list: list[tuple[str, int]], chunk_size: int = 8
+    page_list: list[tuple[str, int]], chunk_size: int = 4
 ) -> list[dict]:
     """
     Fallback for documents without a formal TOC.
     Sequential chunk processing — these calls don't pile up.
+    chunk_size=4: smaller chunks = less context = less hallucination.
     """
     all_items: list[dict] = []
     total = len(page_list)
@@ -836,8 +874,8 @@ def extract_structure_regex(page_list: list[tuple[str, int]], total_pages: int) 
     for text, phys in page_list:
         if not text.strip():
             continue
-        # Check first 5 non-empty lines of each page for heading patterns
-        page_lines = [l.strip() for l in text.splitlines() if l.strip()][:8]
+        # Scan ALL lines — directory docs often have numbered entries at END of pages
+        page_lines = [l.strip() for l in text.splitlines() if l.strip()]
         for line in page_lines:
             if len(line) < 3 or len(line) > 80:
                 continue
