@@ -439,21 +439,41 @@ async def extract_toc_with_retry(toc_raw: str, max_attempts: int = 2) -> str:
 # Stage 3: TOC → Structured JSON
 # ─────────────────────────────────────────────────────────────────────────────
 
-TOC_TRANSFORM_PROMPT = """Transform the following table of contents into a JSON array.
+TOC_TRANSFORM_PROMPT = """Transform the following table of contents into a structured JSON array.
 
-'structure' is the numeric hierarchy: "1", "1.1", "1.2.3" etc.
-If a section has no numeric prefix, use sequential numbers.
+CRITICAL HIERARCHY RULE:
+- Chapter headers → depth 1: "1", "2", "3" ...
+- Sections WITHIN a chapter → depth 2, ALL as siblings: "1.1", "1.2", "1.3" ...
+  NOT as cascading children: NEVER "1.1", "1.1.1", "1.1.1.1"
+- Subsections within a section → depth 3: "1.1.1", "1.1.2" ...
 
-Return JSON:
+EXAMPLE — correct output for a chapter with multiple sections:
+Input TOC:
+  Chapter 1  Relativity            1
+    Special Relativity             2
+    Time Dilation                  5
+    Length Contraction             9
+  Chapter 2  Particle Physics     15
+    Blackbody Radiation           16
+
+Correct JSON:
 {{
   "table_of_contents": [
-    {{"structure": "1", "title": "Introduction", "page": 1}},
-    {{"structure": "1.1", "title": "Background", "page": 2}},
-    ...
+    {{"structure": "1",   "title": "Chapter 1  Relativity",      "page": 1}},
+    {{"structure": "1.1", "title": "Special Relativity",         "page": 2}},
+    {{"structure": "1.2", "title": "Time Dilation",              "page": 5}},
+    {{"structure": "1.3", "title": "Length Contraction",         "page": 9}},
+    {{"structure": "2",   "title": "Chapter 2  Particle Physics","page": 15}},
+    {{"structure": "2.1", "title": "Blackbody Radiation",        "page": 16}}
   ]
 }}
 
-Table of contents:
+WRONG — never do this (each section a child of the previous):
+  {{"structure": "1.1",       "title": "Special Relativity"}},
+  {{"structure": "1.1.1",     "title": "Time Dilation"}},
+  {{"structure": "1.1.1.1",   "title": "Length Contraction"}}
+
+Now transform this table of contents:
 {toc_text}"""
 
 
@@ -515,6 +535,70 @@ Output ONLY the additional entries as a JSON array."""
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Page Offset Detection
+# Books with roman-numeral front matter have a gap between the printed page
+# number in the TOC and the physical PDF page number.
+# e.g. Beiser "Concepts of Modern Physics": printed page 1 = physical page 13.
+# This function detects that offset by finding the first content page.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def detect_page_offset(
+    toc_items: list[dict],
+    page_list: list[tuple[str, int]],
+    total_pages: int,
+    max_search: int = 30,
+) -> int:
+    """
+    Find the physical page offset between printed page numbers (from TOC)
+    and actual PDF physical pages.
+
+    Strategy:
+    1. Take the first TOC item with a page number (usually chapter 1, page 1-5).
+    2. Search physical pages 1..max_search for the item's title text.
+    3. offset = physical_page_found - toc_printed_page.
+
+    Returns 0 if no offset is detected (offset-free or detection failed).
+    """
+    page_map = {phys: text.lower() for text, phys in page_list}
+
+    # Find first TOC item that has a page number and a non-trivial title
+    anchor_items = [
+        item for item in toc_items
+        if item.get("page") and item.get("title") and len(item["title"]) > 3
+    ]
+    if not anchor_items:
+        return 0
+
+    # Use the first chapter-level item (structure "1" or similar)
+    anchor = anchor_items[0]
+    toc_page = anchor["page"]
+    title_lower = anchor["title"].lower().strip()
+
+    # Search in a window around where we'd expect the content to start
+    # For books with front matter, content usually starts between page 5-40
+    for physical in range(1, min(max_search + 1, total_pages + 1)):
+        page_text = page_map.get(physical, "")
+        if title_lower in page_text:
+            offset = physical - toc_page
+            if offset != 0:
+                print(f"[PageIndex] Page offset detected: +{offset} "
+                      f"('{anchor['title']}' TOC page {toc_page} → physical page {physical})")
+            return offset
+
+    return 0
+
+
+def apply_page_offset(toc_items: list[dict], offset: int) -> list[dict]:
+    """Add offset to every item's page number so physical_index assignment is correct."""
+    if offset == 0:
+        return toc_items
+    for item in toc_items:
+        if item.get("page") is not None:
+            item["page"] = item["page"] + offset
+    return toc_items
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Stage 4: Assign Physical Indices
 # FIX 7 (Stage 4 shortcut): Text-match check before calling LLM.
 # If the section title appears verbatim on the TOC-stated page (or ±1),
@@ -551,10 +635,11 @@ async def assign_physical_indices(
 
         title_lower = (item.get("title") or "").lower().strip()
 
-        # FIX 7: Fast text-match shortcut — no LLM needed if title found in page text.
-        # Check the TOC-stated page and the next page (common off-by-one).
+        # Fast text-match shortcut — no LLM needed if title found in page text.
+        # Search ±3 pages around toc_page (offset may not be perfectly exact).
         if title_lower and len(title_lower) > 3:
-            for candidate in [toc_page, toc_page + 1, toc_page - 1]:
+            search_range = [toc_page] + [toc_page + d for d in [1, -1, 2, -2, 3, -3]]
+            for candidate in search_range:
                 if candidate < 1 or candidate > total_pages:
                     continue
                 page_text = page_map.get(candidate, "").lower()
@@ -600,7 +685,9 @@ def build_tree_from_flat(items: list[dict], total_pages: int) -> list[dict]:
     def parse_depth(structure: str) -> int:
         if not structure:
             return 1
-        return len(structure.split("."))
+        # Cap at depth 4 — prevents 30-level chains from bad LLM structure strings.
+        # Real academic books rarely go deeper than: chapter → section → subsection.
+        return min(len(structure.split(".")), 4)
 
     try:
         items = sorted(
@@ -1047,12 +1134,21 @@ async def build_document_tree(
             toc_items = await toc_to_json(toc_cleaned)
             print(f"[PageIndex] TOC items: {len(toc_items)}")
 
+            # ── Stage 3.5: Detect and apply page offset ─────────────────────
+            # Books with roman-numeral front matter have offset between
+            # printed TOC page numbers and physical PDF page numbers.
+            # Must be applied BEFORE Stage 4 or all physical_index assignments are wrong.
+            offset = detect_page_offset(toc_items, page_list, total_pages)
+            if offset != 0:
+                toc_items = apply_page_offset(toc_items, offset)
+
             # ── Stage 4: Assign physical indices (text-shortcut) ─────────────
             toc_items = await assign_physical_indices(toc_items, page_list, total_pages)
 
         else:
             print("[PageIndex] No TOC — falling back to page-by-page extraction")
             toc_items = await extract_structure_no_toc(page_list)
+            offset = 0  # no offset detection without a TOC
             print(f"[PageIndex] Fallback items: {len(toc_items)}")
 
         if not toc_items:
@@ -1092,6 +1188,7 @@ async def build_document_tree(
             "total_pages": total_pages,
             "toc_found": has_toc,
             "toc_pages": toc_pages,
+            "page_offset": offset if has_toc else 0,
             "status": "completed",
         }
 
